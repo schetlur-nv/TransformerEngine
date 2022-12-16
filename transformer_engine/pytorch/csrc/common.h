@@ -46,6 +46,7 @@ class FP8TensorMeta {
 // and `amax` tensors in the `FP8TensorMeta` class.
 enum FP8FwdTensors {
     GEMM1_INPUT  = 0,
+    GEMM1_INPUT2 = 1,
     GEMM1_WEIGHT = 1,
     GEMM2_INPUT  = 2,
     GEMM2_WEIGHT = 3

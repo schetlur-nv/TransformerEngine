@@ -519,6 +519,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::enum_<transformer_engine::FP8FwdTensors>(m, "FP8FwdTensors")
     .value("GEMM1_INPUT", transformer_engine::FP8FwdTensors::GEMM1_INPUT)
+    .value("GEMM1_INPUT2", transformer_engine::FP8FwdTensors::GEMM1_INPUT2)
     .value("GEMM1_WEIGHT", transformer_engine::FP8FwdTensors::GEMM1_WEIGHT)
     .value("GEMM2_INPUT", transformer_engine::FP8FwdTensors::GEMM2_INPUT)
     .value("GEMM2_WEIGHT", transformer_engine::FP8FwdTensors::GEMM2_WEIGHT);

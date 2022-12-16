@@ -121,7 +121,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         """Init scales and amaxes for fwd | bwd."""
         fp8_meta_tensor_key = "scaling_fwd" if fwd else "scaling_bwd"
         num_fp8_tensors = (
-            self.fp8_meta["num_gemms"] * 2 if fwd else self.fp8_meta["num_gemms"]
+            self.fp8_meta["num_weights"] * 2 if fwd else self.fp8_meta["num_weights"]
         )
 
         self.fp8_meta[fp8_meta_tensor_key] = tex.FP8TensorMeta()
@@ -186,7 +186,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             scale_bwd = state[2]
             amax_history_bwd = state[3]
             self.fp8_meta["recipe"].amax_history_len = amax_history_fwd.shape[0]
-            self.fp8_meta["num_gemms"] = (
+            self.fp8_meta["num_weights"] = (
                 amax_history_fwd.shape[1] // 2
             )  # Two FWD tensors per GEMM
 
@@ -304,7 +304,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
     # This routine is shared across FP8 and FP8_calibration paths so should not actually
     # assume FP8 execution.
-    def fp8_init(self, num_gemms: int = 1) -> None:
+    def fp8_init(self, num_weights: int = 1) -> None:
         """Initialize fp8 related metadata and tensors during fprop."""
         if is_fp8_enabled() or is_fp8_calibration():
             # FP8 init has already been run and recipe is the same, don't do anything.
@@ -315,7 +315,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             self.fp8 = is_fp8_enabled()
             self.fp8_calibration = is_fp8_calibration()
             self.fp8_meta["recipe"] = get_fp8_recipe()
-            self.fp8_meta["num_gemms"] = num_gemms
+            self.fp8_meta["num_weights"] = num_weights
             self.fp8_meta["fp8_group"] = get_fp8_group()
 
             # Set FP8_MAX per tensor according to recipe
@@ -330,7 +330,64 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             self.fp8_initialized = False
             return
 
-    def pre_forward(self, inp: torch.Tensor, weight: Optional[torch.Tensor] = None, num_gemms: int = 1) -> None:
+    def pre_forward_no_weights(self, inp1: torch.Tensor, inp2: torch.Tensor) -> None:
+        """Checks and prep for FWD."""
+
+        assert (self.fp8 and self.training) == False, "Using fp8 for BMM is not recommended for training."
+
+        # Activation recomputation is used and this is the second forward phase.
+        if self.fp8 and in_fp8_activation_recompute_phase():
+            get_old_fp8_meta_tensors_for_recompute(self.fp8_meta)
+            return
+
+        assert inp.is_cuda, "TransformerEngine needs CUDA."
+
+        assert inp1.dtype == inp2.dtype, "Inputs both need to be the same dtype."
+
+        self.set_activation_dtype(inp1)
+        self.fp8_init(num_weights=0)
+
+        # Previous iteration was grad_enabled
+        if self.fp8_meta.get("update_amax_and_scale_fwd", False):
+            if self.fp8_meta["recipe"].reduce_amax:
+                copy_amax_from_global_buffer(self.fp8_meta, forward=True)
+                amax_and_scale_update(self.fp8_meta, True)
+                set_amax_buffer_key_deletion(self.fp8_meta, forward=True)
+            else:
+                amax_and_scale_update(self.fp8_meta, True)
+
+        # This should only be needed for calibration since we don't recommend FP8 BMMs for training
+        needs_stats = self.fp8_calibration
+
+        if needs_stats:
+            # Setup for amax reduction
+            if self.fp8_meta["recipe"].reduce_amax:
+                self.fp8_meta["first_module"] = is_first_fp8_module()
+                if self.fp8_meta["first_module"]:
+                    self.fp8_meta["autocast_id_fwd"] = new_fp8_context_id()
+                    set_fp8_context_id(self.fp8_meta["autocast_id_fwd"])
+                else:
+                    self.fp8_meta["autocast_id_fwd"] = get_fp8_context_id()
+                add_amax_to_global_buffer(self.fp8_meta, forward=True)
+            self.fp8_meta["update_amax_and_scale_fwd"] = True
+        else:
+            self.fp8_meta["update_amax_and_scale_fwd"] = False
+
+
+        if self.fp8_calibration:
+            # amax of inputs
+            self.fp8_meta["scaling_fwd"].amax_history[0][tex.FP8FwdTensors.GEMM1_INPUT] = torch.amax(inp1).float()
+            self.fp8_meta["scaling_fwd"].amax_history[0][tex.FP8FwdTensors.GEMM1_INPUT2] = torch.amax(inp2).float()
+
+        # Activation recomputation is used and this is the first forward phase.
+        if (
+            self.fp8
+            and is_fp8_activation_recompute_enabled()
+            and not in_fp8_activation_recompute_phase()
+        ):
+            copy_forward_fp8_meta_tensors_for_recompute(self.fp8_meta)
+
+    def pre_forward(self, inp: torch.Tensor, weight: Optional[torch.Tensor] = None, num_weights: int = 1) -> None:
         """Checks and prep for FWD."""
 
         # Activation recomputation is used and this is the second forward phase.
@@ -344,7 +401,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             assert self.tp_group_initialized, "TP group not initialized."
 
         self.set_activation_dtype(inp)
-        self.fp8_init(num_gemms=num_gemms)
+        self.fp8_init(num_weights=num_weights)
         self.set_fp8_weights()
 
         # Previous iteration was grad_enabled
@@ -375,11 +432,11 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
 
         if self.fp8_calibration:
-            # amax of input
+            assert self.num_weights <= 1, "Calibration not supported for  > 1 weights."
             self.fp8_meta["scaling_fwd"].amax_history[0][tex.FP8FwdTensors.GEMM1_INPUT] = torch.amax(inp).float()
             # amax of weight
             self.fp8_meta["scaling_fwd"].amax_history[0][tex.FP8FwdTensors.GEMM1_WEIGHT] = torch.amax(weight).float()
-           
+
         # Activation recomputation is used and this is the first forward phase.
         if (
             self.fp8
@@ -399,7 +456,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             restore_fp8_meta_tensors(self.fp8_meta)
             return
 
-        if self.fp8 and self.training and self.fp8_meta["recipe"].reduce_amax:
+        needs_stats = (self.fp8 and self.training) or self.fp8_calibration
+
+        if needs_stats and self.fp8_meta["recipe"].reduce_amax:
             set_fp8_context_id(self.fp8_meta["autocast_id_fwd"])
             reduce_func = partial(
                 global_amax_reduction,
@@ -1636,7 +1695,7 @@ class Linear(TransformerEngineBaseModule):
                                produced)
         """
 
-        self.pre_forward(inp, weight if weight is not None else self.weight)
+        self.pre_forward(inp, inp2=None, weight if weight is not None else self.weight)
 
         bias_tensor = bias if bias is not None else self.bias
 
@@ -1666,6 +1725,39 @@ class Linear(TransformerEngineBaseModule):
         if self.return_bias:
             return out, cast_if_needed(bias_tensor, self.activation_dtype)
         return out
+
+class baddbmm(TransformerEngineBaseModule):
+    def __init__(
+        self,
+        batchC: Tensor,
+        batchA: Tensor,
+        batchB: Tensor,
+        beta: float,
+        alpha: float,
+    ) -> None:
+        super().__init__()
+        self.batchC = batchC
+        self.batchA = batchA
+        self.batchB = batchB
+        self.beta = beta
+        self.alpha = alpha
+
+    def forward(
+        self,
+        batchC: Tensor,
+        batchA: Tensor,
+        batchB: Tensor,
+        beta: float,
+        alpha: float,) -> torch.Tensor:
+
+        self.pre_forward_no_weights(self.batchA, self.batchB)
+
+        out = torch.baddbmm(self.batchC, self.batchA, self.batchB, self.beta, self.alpha)
+
+        self.post_forward()
+
+        return out
+
 
 
 class _LayerNormMLP(torch.autograd.Function):
@@ -2439,7 +2531,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                                produced)
         """
 
-        self.pre_forward(inp, num_gemms=2)
+        self.pre_forward(inp, num_weights=2)
 
         out = _LayerNormMLP.apply(
             inp,
